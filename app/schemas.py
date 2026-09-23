@@ -326,6 +326,67 @@ class InstrumentDeactivationResult(BaseModel):
     )
 
 
+# ---------- 仪器时间窗覆盖查询输出 ----------
+
+class CoverageSegment(BaseModel):
+    """时间窗内状态恒定的一个区段（按起点升序，互不重叠，覆盖整个查询窗）。"""
+
+    start: datetime = Field(..., description="区段起点（UTC）")
+    end: datetime = Field(..., description="区段终点（UTC）")
+    start_inclusive: bool = Field(
+        ..., description="是否包含起点；与相邻区段在边界点上恰好一含一不含"
+    )
+    end_inclusive: bool = Field(
+        ..., description="是否包含终点；与相邻区段在边界点上恰好一含一不含"
+    )
+    resolution: str = Field(
+        ..., description="unique | ambiguous | broken（与 /api/reports 同义）"
+    )
+    valid: bool = Field(..., description="该区段代表采样点上唯一成链且无 ERROR")
+    conflict_codes: List[str] = Field(
+        default_factory=list,
+        description="该区段全部冲突码（去重排序）；合并时按冲突码多重集判定",
+    )
+    error_count: int
+    warning_count: int
+    sample_at: datetime = Field(
+        ...,
+        description=(
+            "该区段代表评估点：点区段为该边界点本身；"
+            "开区间区段为两端点之间的内部采样时刻（整秒中点或半秒）"
+        ),
+    )
+    starts: List[str] = Field(
+        default_factory=list, description="代表采样点上该仪器的有效起点证书"
+    )
+    conflicts: List[Conflict] = Field(
+        default_factory=list, description="代表采样点的完整可解释冲突明细"
+    )
+    statistics: dict = Field(default_factory=dict)
+
+
+class CoverageWindowReport(BaseModel):
+    instrument: str
+    window_start: datetime = Field(..., description="查询窗起点（UTC，含）")
+    window_end: datetime = Field(..., description="查询窗终点（UTC，含）")
+    boundary_count: int = Field(
+        ..., description="窗内相关证书/溯源边有效期边界点数量（不含窗口端点）"
+    )
+    grid_points: List[datetime] = Field(
+        default_factory=list,
+        description="窗口端点与窗内边界点合并去重、升序排列后的完整网格",
+    )
+    segment_count: int
+    segments: List[CoverageSegment] = Field(
+        default_factory=list,
+        description=(
+            "按时间排列的状态区段；仅当 resolution/valid/冲突码多重集相同"
+            "且端点严格连续（一开一闭相接）时合并，瞬时冲突独占点区段"
+        ),
+    )
+    statistics: dict = Field(default_factory=dict)
+
+
 class DeactivationImpactReport(BaseModel):
     at: datetime
     dry_run: bool = Field(

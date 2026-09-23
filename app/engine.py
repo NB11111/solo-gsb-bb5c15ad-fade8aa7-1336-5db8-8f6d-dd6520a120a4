@@ -18,13 +18,15 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from .crud import ValidationError, get_instrument
 from .utils import UNCERTAINTY_EPS, compute_digest, fmt, to_utc_naive
 
 MAX_PATHS = 500  # 候选链枚举上限，防止异常数据下的指数膨胀
+
+_TS_PARSE_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 # ---------------------------------------------------------------- 数据装载
@@ -925,5 +927,196 @@ def assess_deactivation(
             "certificates_after": len(simulated.certs),
             "edges_before": len(base.edges),
             "edges_after": len(simulated.edges),
+        },
+    }
+
+
+# ---------------------------------------------------------------- 仪器时间窗覆盖查询
+
+def _parse_ts(s: str) -> datetime:
+    """内部采样串解析（接受整秒 UTC 串及 ``Z\x7f`` 后缀的半开哨兵串）。"""
+    return datetime.strptime(s.rstrip("\x7f"), _TS_PARSE_FMT)
+
+
+def _collect_relevant_boundaries(
+    cat: Catalog, instrument_code: str, lo_s: str, hi_s: str
+) -> set[str]:
+    """收集窗口内与该仪器溯源评估相关的全部有效期边界。
+
+    范围 = 该仪器全部证书 → 沿“子→父”边闭包可达的全部证书与边
+    （国家基准证书一并纳入，保证根节点检查一致）；各证书/边的
+    valid_from / valid_until 落在闭查询窗内的即为边界。
+    区间有效性按闭区间判定，因此边界点本身单独评估，不并入开区间。
+    """
+    relevant_certs: set[str] = set()
+    stack = [
+        cid
+        for cid, c in cat.certs.items()
+        if c["instrument_code"] == instrument_code
+    ]
+    while stack:
+        cid = stack.pop()
+        if cid in relevant_certs or cid not in cat.certs:
+            continue
+        relevant_certs.add(cid)
+        cert = cat.certs[cid]
+        if cat.instruments[cert["instrument_code"]]["is_national_standard"]:
+            # 根节点不再向上溯源
+            continue
+        for e in cat.out_edges.get(cid, []):
+            stack.append(e["parent_cert_id"])
+
+    boundaries: set[str] = set()
+
+    def clamp_add(ts: str) -> None:
+        if lo_s <= ts <= hi_s:
+            boundaries.add(ts)
+
+    for cid in relevant_certs:
+        c = cat.certs[cid]
+        clamp_add(c["valid_from"])
+        clamp_add(c["valid_until"])
+        for e in cat.out_edges.get(cid, []):
+            clamp_add(e["valid_from"])
+            clamp_add(e["valid_until"])
+    return boundaries
+
+
+def _interior_moment(lo_s: str, hi_s: str) -> tuple[str, datetime]:
+    """两个整秒网格点之间严格位于内部的采样时刻。
+
+    跨度 >=2 秒取整秒中点；跨度 1 秒时取后半秒，并在内部串上追加
+    ``\\x7f`` 哨兵后缀，使其字符串序严格位于整秒点 ``tZ`` 与
+    ``t+1sZ`` 之间（时间存储串按字典序比较）。内部串只用于本次查询，
+    既不入库也不出现在响应中（响应的 sample_at 给出真实采样时刻）。
+    """
+    lo_dt, hi_dt = _parse_ts(lo_s), _parse_ts(hi_s)
+    mid = lo_dt + (hi_dt - lo_dt) / 2
+    if (hi_dt - lo_dt) >= timedelta(seconds=2):
+        sample = mid.replace(microsecond=0)
+    else:
+        sample = mid
+    return fmt(sample) + ("\x7f" if sample.microsecond else ""), sample
+
+
+def _sample_key(report: dict[str, Any]) -> tuple:
+    """区段合并依据：状态 + 有效性 + 冲突码多重集（含数量，保序）。"""
+    codes = tuple(sorted(c["code"] for c in report["conflicts"]))
+    return (report["resolution"], report["valid"], codes)
+
+
+def _display_ts(dt_value: datetime) -> str:
+    """对外展示用 UTC 串（整秒为 Z 结尾，半开采样保留微秒）。"""
+    base = dt_value.strftime(_TS_PARSE_FMT[:-1])  # 去掉结尾 Z
+    if dt_value.microsecond:
+        base += f".{dt_value.microsecond:06d}"
+    return base + "Z"
+
+
+def build_window_report(
+    conn: sqlite3.Connection,
+    instrument_code: str,
+    start: datetime,
+    end: datetime,
+) -> dict[str, Any]:
+    """按有效期边界把 [start, end]（UTC 闭区间）划分为状态区段。
+
+    1. 收集与该仪器相关证书/溯源边在窗内的全部有效期边界；
+    2. 边界点（闭区间端点）与相邻边界间开区间分别评估现有校验报告；
+    3. 仅当状态、有效性、冲突码多重集相同且端点严格连续时才合并，
+       每段显式标明 start_inclusive / end_inclusive，
+       避免闭区间交接时吞掉仅存在于瞬时（边界点）的冲突。
+    """
+    start_naive = to_utc_naive(start)
+    end_naive = to_utc_naive(end)
+    if start_naive > end_naive:
+        raise ValidationError(
+            f"时间窗起点 {fmt(start_naive)} 不能晚于终点 {fmt(end_naive)}"
+        )
+    lo_s = fmt(start_naive)
+    hi_s = fmt(end_naive)
+
+    instrument = get_instrument(conn, instrument_code)
+    if instrument is None:
+        raise KeyError(instrument_code)
+
+    cat = Catalog(conn)
+    boundaries = _collect_relevant_boundaries(cat, instrument_code, lo_s, hi_s)
+    grid = sorted({lo_s, hi_s, *boundaries})
+
+    # 原子段：(起点, 终点, 起点是否包含, 终点是否包含, 代表报告, 真实采样时刻)
+    atoms: list[tuple[str, str, bool, bool, dict[str, Any], datetime]] = []
+    for idx, t in enumerate(grid):
+        if lo_s <= t <= hi_s:
+            atoms.append(
+                (t, t, True, True, _build_report(cat, instrument_code, t),
+                 _parse_ts(t))
+            )
+        if idx + 1 < len(grid):
+            t1, t2 = grid[idx], grid[idx + 1]
+            if t1 < t2 and lo_s <= t1 and t2 <= hi_s:
+                inner_s, inner_dt = _interior_moment(t1, t2)
+                atoms.append(
+                    (t1, t2, False, False,
+                     _build_report(cat, instrument_code, inner_s), inner_dt)
+                )
+
+    # 相邻且键相同才合并；端点包含性取最左/最右原子段
+    merged: list[dict[str, Any]] = []
+    for a_lo, a_hi, a_lo_in, a_hi_in, rep, sample_dt in atoms:
+        key = _sample_key(rep)
+        if merged:
+            prev = merged[-1]
+            contiguous = (
+                prev["_key"] == key
+                and prev["end"] == a_lo
+                and prev["end_inclusive"] != a_lo_in
+            )
+            if contiguous:
+                prev["end"] = a_hi
+                prev["end_inclusive"] = a_hi_in
+                continue
+        merged.append(
+            {
+                "_key": key,
+                "start": a_lo,
+                "end": a_hi,
+                "start_inclusive": a_lo_in,
+                "end_inclusive": a_hi_in,
+                "_rep": rep,
+                "_sample_at": sample_dt,
+            }
+        )
+
+    segments = []
+    for m in merged:
+        rep = m.pop("_rep")
+        sample_dt = m.pop("_sample_at")
+        m.pop("_key")
+        m["resolution"] = rep["resolution"]
+        m["valid"] = rep["valid"]
+        m["conflict_codes"] = sorted({c["code"] for c in rep["conflicts"]})
+        m["error_count"] = rep["error_count"]
+        m["warning_count"] = rep["warning_count"]
+        m["sample_at"] = _display_ts(sample_dt)
+        m["starts"] = rep["starts"]
+        m["conflicts"] = rep["conflicts"]
+        m["statistics"] = rep["statistics"]
+        segments.append(m)
+
+    return {
+        "instrument": instrument_code,
+        "window_start": lo_s,
+        "window_end": hi_s,
+        "boundary_count": len(boundaries),
+        "grid_points": grid,
+        "segment_count": len(segments),
+        "segments": segments,
+        "statistics": {
+            "boundaries_in_window": len(boundaries),
+            "grid_points": len(grid),
+            "point_samples": sum(1 for a in atoms if a[0] == a[1]),
+            "interval_samples": sum(1 for a in atoms if a[0] != a[1]),
+            "reports_evaluated": len(atoms),
         },
     }

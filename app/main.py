@@ -59,6 +59,10 @@ def root():
         "endpoints": {
             "chain_query": "/api/trace/{instrument}?at=YYYY-MM-DDTHH:MM:SSZ",
             "validation_report": "/api/reports/{instrument}",
+            "time_window_coverage": (
+                "/api/coverage/{instrument}"
+                "?start=YYYY-MM-DDTHH:MM:SSZ&end=YYYY-MM-DDTHH:MM:SSZ"
+            ),
             "json_export": "/api/export/{instrument}",
             "batch_submission": "POST /api/submissions",
             "batch_submission_preflight": (

@@ -59,7 +59,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（29 个用例）
+pytest -q        # 运行测试（39 个用例）
 ```
 
 > 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
@@ -105,6 +105,7 @@ trace_edges（父子溯源边）
 | GET | `/api/edges` | 溯源边列表 |
 | **GET** | **`/api/trace/{instrument}?at=`** | **链路查询：重建唯一证书链** |
 | **GET** | **`/api/reports/{instrument}?at=`** | **校验报告（冲突明细）** |
+| **GET** | **`/api/coverage/{instrument}?start=&end=`** | **仪器时间窗覆盖查询：按有效期边界输出状态区段** |
 | **GET** | **`/api/export/{instrument}?at=`** | **JSON 导出（attachment 下载）** |
 | **POST** | **`/api/assessments/certificate-deactivation`** | **证书停用影响评估（dry-run，不写库）** |
 | POST | `/api/admin/reset` | 清空全部数据（演示/测试用） |
@@ -246,6 +247,103 @@ curl "http://localhost:8000/api/trace/W?at=2026-06-15T00:00:00Z"
 curl "http://localhost:8000/api/reports/W?at=2026-06-15T00:00:00Z"
 curl -OJ "http://localhost:8000/api/export/W?at=2026-06-15T00:00:00Z"
 ```
+
+#### 4.1）仪器时间窗覆盖查询（GET /api/coverage/{instrument}）
+
+需要回答“这台仪器在**一段时间内**分别处于什么溯源状态、冲突在何时出现/消失”时，
+传入仪器编码与 UTC 闭时间窗 `start`、`end`：
+
+```bash
+curl -G "http://localhost:8000/api/coverage/INST-T1" \
+  --data-urlencode "start=2025-01-01T00:00:00Z" \
+  --data-urlencode "end=2025-12-31T23:59:59Z"
+```
+
+服务端按以下步骤计算：
+
+1. 收集与该仪器相关的证书与父子溯源边（从该仪器证书出发沿“子→父”闭包可达，
+   含国家基准根证书）落在窗内的全部有效期边界 `valid_from / valid_until`；
+2. 窗口端点与这些边界合并去重、升序排列为评估网格 `grid_points`；
+3. 在**每个边界点**（证书/边有效期均为闭区间）与每对相邻边界之间的**开区间内部**
+   各运行一次现有时点校验报告（`/api/reports` 的同一引擎）；
+4. 按时间顺序输出状态区段 `segments`：**仅当** `resolution`（状态）、`valid`
+   （有效性）与冲突码多重集完全相同，且两端**严格连续**（端点时间相等且一含一不含）
+   时才把相邻段合并。
+
+每个区段显式标明 `start_inclusive` / `end_inclusive`（端点是否包含）。
+因此当相邻证书有效期首尾相接（闭区间，如前证 `valid_until == 后证 valid_from`）时，
+**交接点上的瞬时冲突**（典型：该瞬时两张证书同时有效 → `MULTIPLE_ACTIVE_CERTIFICATES`
++ `MULTIPLE_VALID_CHAINS`）会保留为一个零长度、两端都含的独立点区段，
+不会被两侧状态相同的开区间吞掉：
+
+```jsonc
+{
+  "instrument": "W",
+  "window_start": "2026-01-01T00:00:00Z",
+  "window_end": "2027-01-01T00:00:00Z",
+  "boundary_count": 1,
+  "grid_points": ["2026-01-01T00:00:00Z",
+                  "2026-06-01T00:00:00Z",   // 两张证书闭区间交接点
+                  "2027-01-01T00:00:00Z"],
+  "segment_count": 3,
+  "segments": [
+    {
+      "start": "2026-01-01T00:00:00Z", "end": "2026-06-01T00:00:00Z",
+      "start_inclusive": true,  "end_inclusive": false,   // 左闭右开
+      "resolution": "unique", "valid": true,
+      "conflict_codes": [], "error_count": 0, "warning_count": 0,
+      "sample_at": "2026-01-01T00:00:00Z", "starts": ["CW-1"],
+      "conflicts": [ /* 与 /api/reports 同构的完整冲突明细 */ ]
+    },
+    {
+      "start": "2026-06-01T00:00:00Z", "end": "2026-06-01T00:00:00Z",
+      "start_inclusive": true,  "end_inclusive": true,    // 瞬时点区段：两端都含
+      "resolution": "ambiguous", "valid": false,
+      "conflict_codes": ["MULTIPLE_ACTIVE_CERTIFICATES",
+                         "MULTIPLE_VALID_CHAINS"],
+      "sample_at": "2026-06-01T00:00:00Z", "starts": ["CW-1", "CW-2"]
+    },
+    {
+      "start": "2026-06-01T00:00:00Z", "end": "2027-01-01T00:00:00Z",
+      "start_inclusive": false, "end_inclusive": true,    // 左开右闭
+      "resolution": "unique", "valid": true,
+      "conflict_codes": [],
+      "sample_at": "2026-09-16T00:00:00Z", "starts": ["CW-2"]
+    }
+  ],
+  "statistics": {"boundaries_in_window": 1, "grid_points": 3,
+                 "point_samples": 3, "interval_samples": 2,
+                 "reports_evaluated": 5}
+}
+```
+
+区段字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `start` / `end` | 区段端点（UTC）；点区段二者相等 |
+| `start_inclusive` / `end_inclusive` | 是否包含对应端点；相邻区段在公共端点上恰好一含一不含 |
+| `resolution` | `unique` / `ambiguous` / `broken`，含义与时点报告一致 |
+| `valid` | 代表采样点上唯一成链且无 ERROR |
+| `conflict_codes` | 该区段全部冲突码（去重排序）；合并判定使用冲突码**多重集**（同码出现次数也需一致） |
+| `error_count` / `warning_count` | 代表采样点的 ERROR/WARN 数量 |
+| `sample_at` | 代表评估点：点区段为边界点本身；开区间区段为两端点之间的内部采样时刻（整秒中点；两端相隔 1 秒时为后半秒） |
+| `starts` / `conflicts` | 代表采样点的有效起点证书与完整可解释冲突明细（结构同 `/api/reports`） |
+
+特性与约束：
+
+- 区段按时间升序、互不重叠且完整覆盖闭窗口 `[start, end]`；
+  窗口端点恒被包含（首段 `start_inclusive=true`、末段 `end_inclusive=true`）。
+- 状态在边界**两侧开区间相同、但边界点本身不同**（瞬时冲突）时保留点区段；
+  状态在边界点与一侧也相同时，该点并入对应区段（端点包含性合并后仍正确）。
+- `start` 晚于 `end` 返回 **422**（中文原因）；缺少 `start`/`end` 返回 **422**；
+  仪器不存在返回 **404**。时间入参按 UTC 解释，建议统一用 `...Z` 格式；
+  内部比较按整秒精度，开区间内部采样不会落回端点。
+- 内置演示数据中，热电偶 `INST-T1` 在 2025 年夏季存在证书断档，
+  可直接用本节开头的 curl 观察“有效 → 断档（`INTERVAL_GAP` /
+  `NO_ACTIVE_CERTIFICATE`）→ 恢复”的分段效果。
+
+### 5）证书停用影响评估（dry-run 模拟）
 
 报告关键字段：
 
@@ -393,6 +491,22 @@ curl "http://localhost:8000/api/reports/INST-T1?at=2026-06-15T00:00:00Z"
 curl "http://localhost:8000/api/reports/INST-B1?at=2026-06-15T00:00:00Z"
 ```
 
+时间窗覆盖查询示例：热电偶 `INST-T1` 的旧证 2025-06-30 到期、新证 2025-09-01
+生效，窗内自动划出“有效 → 夏季断档 → 恢复”三段：
+
+```bash
+curl -G "http://localhost:8000/api/coverage/INST-T1" \
+  --data-urlencode "start=2025-01-01T00:00:00Z" \
+  --data-urlencode "end=2025-12-31T23:59:59Z"
+# segments:
+#  [2025-01-01 含, 2025-06-30 含]        broken（DEAD_END：参考标准未再溯源；INTERVAL_GAP）
+#  (2025-06-30, 2025-09-01) 两端均不含   broken（NO_ACTIVE_CERTIFICATE + INTERVAL_GAP 断档）
+#  [2025-09-01 含, 2025-12-31 含]        broken（DEAD_END）
+```
+
+> 三段冲突码不同因此不会合并；若把窗口缩小到不含任何边界的区间，
+> 结果为单个两端都含的区段。
+
 停用评估示例（dry-run）：停用压力多候选中的活塞压力计通道证书，观察
 `INST-P1` 由 `ambiguous` 变为经数字校准器 B 的 `unique` 替代链；停用一等量块
 证书 `CR1-1` 则会使 `INST-W1` 由唯一链变为断裂：
@@ -424,6 +538,11 @@ curl -X POST http://localhost:8000/api/assessments/certificate-deactivation \
 6. 证书停用影响评估：在内存 Catalog 中移除证书及其关联边（不写库），对每台受影响
    仪器分别在停用前/后的 Catalog 上重跑步骤 1~5，比较状态与链指纹，输出迁移、
    被切断链、替代链与 INFO 级模拟说明。
+7. 仪器时间窗覆盖查询：收集该仪器沿溯源边闭包可达的证书/边在窗内的
+   `valid_from / valid_until` 边界，与窗口端点合成评估网格；在每个边界点（闭区间）
+   及相邻边界间的开区间内部各跑一次步骤 1~5；仅当状态、有效性与冲突码多重集相同
+   且端点严格连续（一含一不含）时合并，输出带端点包含标记的时间区段，
+   使闭区间交接点上的瞬时冲突独立成段而不被吞并。
 
 ## 八、项目结构
 
@@ -433,13 +552,15 @@ app/
   database.py        SQLite 连接、表结构
   schemas.py         Pydantic 请求/响应模型
   crud.py            upsert 与写入期校验
-  engine.py          溯源链重建（DFS）、校验规则、停用影响模拟（内存 Catalog）
+  engine.py          溯源链重建（DFS）、校验规则、停用影响模拟（内存 Catalog）、
+                     仪器时间窗覆盖分段（边界点 + 开区间内部采样）
   seed.py            四场景演示数据
   routers/           instruments / certificates / edges /
                      submissions（批量提交 + preflight 预检）/
-                     trace(report + 停用影响评估) / export / admin
+                     trace(report + 时间窗覆盖 + 停用影响评估) / export / admin
 tests/test_trace.py        10 个接口级测试
 tests/test_preflight.py    11 个批量提交预检测试
 tests/test_deactivation.py 8 个停用影响评估测试
+tests/test_coverage.py     10 个仪器时间窗覆盖查询测试
 Dockerfile · docker-compose.yml · requirements.txt
 ```
