@@ -265,6 +265,49 @@ class TraceReport(BaseModel):
     statistics: dict = Field(default_factory=dict)
 
 
+# ---------- 时间窗覆盖查询输出 ----------
+
+class CoverageSegment(BaseModel):
+    """时间窗内状态恒定的一个区段（已按连续性与状态指纹合并）。"""
+
+    start: datetime = Field(..., description="区段起点（UTC，闭区间交接时可能等于 end）")
+    end: datetime = Field(..., description="区段终点（UTC）")
+    include_start: bool = Field(
+        ..., description="起点是否包含于区段（边界点为 true，开区间内侧为 false）"
+    )
+    include_end: bool = Field(
+        ..., description="终点是否包含于区段（边界点为 true，开区间内侧为 false）"
+    )
+    resolution: str = Field(
+        ..., description="该区段内任一时刻的链路状态：unique | ambiguous | broken"
+    )
+    valid: bool = Field(..., description="该区段内是否唯一成链且无 ERROR 级问题")
+    conflict_codes: List[str] = Field(
+        default_factory=list,
+        description="该区段评估报告中的全部冲突码（保留重复、按字典序）",
+    )
+    error_count: int = 0
+    warning_count: int = 0
+
+
+class CoverageReport(BaseModel):
+    instrument: str
+    start: datetime = Field(..., description="查询窗起点（UTC，闭区间）")
+    end: datetime = Field(..., description="查询窗终点（UTC，闭区间）")
+    boundary_points: List[datetime] = Field(
+        default_factory=list,
+        description="窗内参与划分的有效期边界时刻（相关证书 + 溯源边）",
+    )
+    segments: List[CoverageSegment] = Field(
+        default_factory=list, description="按时间排列的状态/有效性/冲突码区段"
+    )
+    segment_count: int
+    evaluated_at_count: int = Field(
+        ..., description="实际评估采样点数（边界点 + 边界间开区间各 1 次）"
+    )
+    statistics: dict = Field(default_factory=dict)
+
+
 # ---------- 证书停用影响评估输出 ----------
 
 class ChainSummary(BaseModel):

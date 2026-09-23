@@ -26,6 +26,21 @@ from .utils import UNCERTAINTY_EPS, compute_digest, fmt, to_utc_naive
 
 MAX_PATHS = 500  # 候选链枚举上限，防止异常数据下的指数膨胀
 
+# 开区间内侧采样标记：见 _inside_sample 说明。ord("~")=126 > ord("Z")=90
+INTERIOR_MARK = "~"
+
+
+def _inside_sample(boundary_s: str) -> str:
+    """边界点“紧邻右侧内侧”的采样串，用于评估开区间 (t, t_next)。
+
+    库内与请求中的时间戳均为秒级文本（``...Z``），字典序即时间序。
+    在末尾追加 ASCII 大于 ``Z`` 的标记后，字典序严格满足
+    ``t < t+MARK < t 的下一秒``，故它与任意真实边界的比较结果等同于
+    “紧邻 t 右侧的瞬间”，且永不与边界本身重合，从而能把闭区间端点上的
+    瞬时状态与两侧开区间区分开。该串仅用于引擎内部比较，不会出现在响应中。
+    """
+    return boundary_s + INTERIOR_MARK
+
 
 # ---------------------------------------------------------------- 数据装载
 
@@ -925,5 +940,177 @@ def assess_deactivation(
             "certificates_after": len(simulated.certs),
             "edges_before": len(base.edges),
             "edges_after": len(simulated.edges),
+        },
+    }
+
+
+# ---------------------------------------------------------------- 时间窗覆盖查询
+
+def _coverage_scope(cat: Catalog, instrument_code: str) -> tuple[set[str], set[int]]:
+    """收集与目标仪器溯源评估相关的证书 id 与溯源边 id。
+
+    覆盖范围：目标仪器的全部证书；由这些证书（含被挂作父证书的）沿
+    子->父方向可达的证书；以及所有端点命中上述证书的溯源边。
+    区间连续性检查涉及的仪器只可能是这些证书的所属仪器，故无需额外扩展。
+    """
+    cert_ids = {
+        cid
+        for cid, c in cat.certs.items()
+        if c["instrument_code"] == instrument_code
+    }
+    stack = list(cert_ids)
+    edge_ids: set[int] = set()
+    while stack:
+        cid = stack.pop()
+        for e in cat.out_edges.get(cid, []):
+            edge_ids.add(e["id"])
+            pid = e["parent_cert_id"]
+            if pid not in cert_ids:
+                cert_ids.add(pid)
+                stack.append(pid)
+    # 目标仪器的证书也可能被挂作其他仪器证书的父节点
+    for e in cat.edges:
+        if e["parent_cert_id"] in cert_ids:
+            cert_ids.add(e["child_cert_id"])
+            edge_ids.add(e["id"])
+    return cert_ids, edge_ids
+
+
+def _boundary_points(
+    cat: Catalog,
+    cert_ids: set[str],
+    edge_ids: set[int],
+    start_s: str,
+    end_s: str,
+) -> list[str]:
+    """收集窗内相关证书/边的全部有效期边界，并夹入窗口两端点。"""
+    points = {start_s, end_s}
+    for cid in cert_ids:
+        c = cat.certs[cid]
+        for t in (c["valid_from"], c["valid_until"]):
+            if start_s <= t <= end_s:
+                points.add(t)
+    for e in cat.edges:
+        if e["id"] not in edge_ids:
+            continue
+        for t in (e["valid_from"], e["valid_until"]):
+            if start_s <= t <= end_s:
+                points.add(t)
+    return sorted(points)
+
+
+def _report_signature(report: dict[str, Any]) -> tuple[Any, ...]:
+    """状态指纹：resolution + 全部冲突码（保留重复，按字典序）。
+
+    仅当两个采样点的状态与冲突码多重集完全一致时才允许合并区段，
+    避免“同状态但冲突不同”（如 broken 因死路 vs. 因断档）被误并。
+    """
+    codes = sorted(c["code"] for c in report["conflicts"])
+    return (report["resolution"], tuple(codes))
+
+
+def _segment_from_sample(report: dict[str, Any], atom_left: str) -> dict[str, Any]:
+    codes = sorted(c["code"] for c in report["conflicts"])
+    return {
+        "start": atom_left,
+        "end": atom_left,  # 由调用方按原子右端与包含标记覆盖
+        "include_start": True,
+        "include_end": True,
+        "resolution": report["resolution"],
+        "valid": report["valid"],
+        "conflict_codes": codes,
+        "error_count": report["error_count"],
+        "warning_count": report["warning_count"],
+        "_sig": _report_signature(report),
+    }
+
+
+def build_coverage(
+    conn: sqlite3.Connection,
+    instrument_code: str,
+    start: datetime,
+    end: datetime,
+) -> dict[str, Any]:
+    """仪器时间窗覆盖查询。
+
+    按相关证书与溯源边的有效期边界把 [start, end] 划分为“边界点原子 +
+    边界间开区间原子”，分别在边界点与开区间内侧采样评估现有校验报告，
+    再把状态与冲突码完全相同且端点连续的相邻原子合并。每个区段均标明
+    端点是否包含，闭区间交接处的瞬时冲突因此不会被相邻区段吞掉。
+    """
+    start_naive = to_utc_naive(start)
+    end_naive = to_utc_naive(end)
+    if start_naive > end_naive:
+        raise ValidationError(
+            f"查询起点 {fmt(start_naive)} 晚于终点 {fmt(end_naive)}，"
+            "时间窗必须满足 start <= end"
+        )
+    start_s, end_s = fmt(start_naive), fmt(end_naive)
+
+    instrument = get_instrument(conn, instrument_code)
+    if instrument is None:
+        raise KeyError(instrument_code)
+
+    cat = Catalog(conn)
+    cert_ids, edge_ids = _coverage_scope(cat, instrument_code)
+    boundaries = _boundary_points(cat, cert_ids, edge_ids, start_s, end_s)
+
+    # 生成有序原子：边界点原子（评估时刻=边界本身，左右均闭）+ 相邻边界
+    # 之间的开区间原子（在左边界紧邻右侧的内侧采样，左右均开）。
+    # 同一开区间内活跃证书/边集合不变，任一时刻评估结果都相同。
+    samples: list[tuple[str, str, bool, bool]] = []
+    # (评估时刻串, 原子右端时刻串, 左闭?, 右闭?)
+    for i, point in enumerate(boundaries):
+        samples.append((point, point, True, True))
+        if i + 1 < len(boundaries) and point != boundaries[i + 1]:
+            samples.append(
+                (_inside_sample(point), boundaries[i + 1], False, False)
+            )
+
+    # 逐原子评估并合并。相邻原子仅在同时满足以下条件时并入前一区段：
+    # 端点连续、状态指纹（resolution + 冲突码多重集）相同、且公共端点至少
+    # 被其中一方包含（两个不含公共端点的开区间之间必隔着边界点原子，不可并）。
+    # 合并后保留首原子的左端包含性与末原子的右端包含性。
+    segments: list[dict[str, Any]] = []
+    eval_count = 0
+
+    for eval_s, right_s, left_closed, right_closed in samples:
+        report = _build_report(cat, instrument_code, eval_s)
+        eval_count += 1
+        atom_left = eval_s if left_closed else eval_s[: -len(INTERIOR_MARK)]
+        seg = _segment_from_sample(report, atom_left)
+        seg["end"] = right_s
+        seg["include_start"] = left_closed
+        seg["include_end"] = right_closed
+
+        if (
+            segments
+            and segments[-1]["end"] == atom_left
+            and (segments[-1]["include_end"] or left_closed)
+            and segments[-1]["_sig"] == seg["_sig"]
+        ):
+            segments[-1]["end"] = right_s
+            segments[-1]["include_end"] = right_closed
+        else:
+            segments.append(seg)
+
+    for seg in segments:
+        seg.pop("_sig", None)
+
+    return {
+        "instrument": instrument_code,
+        "start": start_s,
+        "end": end_s,
+        "boundary_points": boundaries,
+        "segments": segments,
+        "segment_count": len(segments),
+        "evaluated_at_count": eval_count,
+        "statistics": {
+            "instruments_total": len(cat.instruments),
+            "certificates_total": len(cat.certs),
+            "edges_total": len(cat.edges),
+            "relevant_certificates": sorted(cert_ids),
+            "relevant_edge_ids": sorted(edge_ids),
+            "boundary_point_count": len(boundaries),
         },
     }
